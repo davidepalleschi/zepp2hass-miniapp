@@ -1,0 +1,24 @@
+# IDE
+.vs/
+.vscode/
+.idea/
+*.user
+
+# Node
+node_modules/
+npm-debug.log
+package-lock.json
+
+# Build outputs
+dist/
+*.zab
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# ZeppOS
+.zeppos/
