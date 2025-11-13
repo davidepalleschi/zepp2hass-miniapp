@@ -6,17 +6,16 @@
     "appType": "app",
     "version": {
       "code": 1,
-      "name": "1.0.1"
+      "name": "1.1.0"
     },
     "icon": "icon.png",
-    "vender": "sleepagent",
-    "description": "A background service to monitor metrics data and HTTP Post to server"
+    "vender": "davide",
+      "description": "A ZeppOS watch app that collects health and fitness metrics from your smartwatch and sends them to a custom HTTP endpoint."
   },
   "permissions": [
     "device:os.local_storage",
     "data:user.hd.heart_rate",
     "data:user.hd.spo2",
-    "data:user.hd.body_temp",
     "data:user.hd.calorie",
     "data:user.hd.distance",
     "data:user.hd.fat_burning",
@@ -25,20 +24,22 @@
     "data:user.hd.step",
     "data:user.hd.stress",
     "data:user.hd.sleep",
+    "data:user.hd.body_temp",
     "data:user.hd.workout",
     "data:user.info",
 
     "data:os.device.info",
-
+    "device:os.alarm",
     "device:os.bg_service",
     "device:os.notification",
-    "device:os.alarm"
+    "system:network.internet",
+    "device:os.ble"
   ],
   "runtime": {
     "apiVersion": {
-      "compatible": "3.0.0",
-      "target": "3.0.0",
-      "minVersion": "3.0"
+      "compatible": "4.0.0",
+      "target": "4.0.0",
+      "minVersion": "4.0"
     }
   },
   "targets": {
@@ -52,6 +53,9 @@
         "app-side": {
           "path": "app-side/index"
         },
+        "setting": {
+          "path": "settings/index"
+    },
         "app-service": {
           "services": ["app-service/background_service"]
         }
@@ -63,7 +67,7 @@
         },
         {
           "st": "s",
-          "dw": 390
+          "dw": 480
         }
       ]
     }

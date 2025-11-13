@@ -1,34 +1,16 @@
-import { log } from "@zos/utils";
-import { replace } from "@zos/router";
-import * as appService from "@zos/app-service";
 import hmUI from "@zos/ui";
+import * as alarmMgr from "@zos/alarm";
+import { BasePage } from "@zeppos/zml/base-page";
 import { queryPermission, requestPermission } from "@zos/app";
-import {
-  SERVICE_TEXT,
-  SERVICE_LABEL,
-  SERVICE_BTN,
-} from "zosLoader:./index.[pf].layout.js";
+import { FETCH_BUTTON } from "zosLoader:./index.[pf].layout.js";
 
-function setProperty(w, p, v) {
-  w.setProperty(p, v);
-}
-
-let thisFile = "pages/index";
+const permissions = ["device:os.bg_service"];
 const serviceFile = "app-service/background_service";
 
-const txtResource = {
-  label: {
-    true: "Click button to stop service!",
-    false: "Click button to start service!",
-  },
-  btn: {
-    true: "Stop Service",
-    false: "Start Service",
-  },
-};
-const logger = log.getLogger("bgService.page");
-// Start background service
-const permissions = ["device:os.bg_service"];
+// Get interval from storage (default to 1 minute for now)
+function getIntervalMinutes() {
+  return 1; // Default to 1 minute
+}
 
 function permissionRequest(vm) {
   const [result2] = queryPermission({
@@ -49,108 +31,62 @@ function permissionRequest(vm) {
   }
 }
 
+
 function startTimeService(vm) {
-  logger.log(`=== start service: ${serviceFile} ===`);
-  const result = appService.start({
-    url: serviceFile,
-    param: `service=${serviceFile}&action=start`,
-    complete_func: (info) => {
-      logger.log(`startService result: ` + JSON.stringify(info));
-      hmUI.showToast({ text: `start result: ${info.result}` });
-      // refresh for button status
+  console.log(`=== starting service: ${serviceFile} ===`);
 
-      if (info.result) {
-        vm.state.running = true;
-        setProperty(
-          vm.state.txtLabel,
-          hmUI.prop.TEXT,
-          txtResource.label[vm.state.running]
-        );
-        setProperty(
-          vm.state.serviceBtn,
-          hmUI.prop.TEXT,
-          txtResource.btn[vm.state.running]
-        );
-      }
-    },
-  });
+  const alarms = alarmMgr.getAllAlarms();
+  const biodataAlarmService = alarms.length === 2;
+  const intervalMinutes = getIntervalMinutes();
 
-  if (result) {
-    logger.log("startService result: ", result);
+  if (!biodataAlarmService) {
+    const option = {
+      url: serviceFile,
+      repeat_type: alarmMgr.REPEAT_MINUTE,
+      repeat_period: intervalMinutes,
+      repeat_duration: 1,
+      store: true,
+      delay: 40,
+    };
+    console.log(`=== starting alarm: ${serviceFile} === Interval: ${intervalMinutes} min, Alarms: ${alarms.length}: ${JSON.stringify(alarms)}`);
+    alarmMgr.set(option);
+    hmUI.showToast({ text: `Service alarm set (${intervalMinutes} min interval)` });
+  } else {
+    console.log(`=== alarm already exists === Interval: ${intervalMinutes} min, Alarms: ${alarms.length}: ${JSON.stringify(alarms)}`);
+    hmUI.showToast({ text: `Service alarm already set (${intervalMinutes} min interval)` });
   }
 }
 
-function stopTimeService(vm) {
-  logger.log(`=== stop service: ${serviceFile} ===`);
-  appService.stop({
-    url: serviceFile,
-    param: `service=${serviceFile}&action=stop`,
-    complete_func: (info) => {
-      logger.log(`stopService result: ` + JSON.stringify(info));
-      hmUI.showToast({ text: `stop result: ${info.result}` });
-      // refresh for button status
-
-      if (info.result) {
-        vm.state.running = false;
-        setProperty(
-          vm.state.txtLabel,
-          hmUI.prop.TEXT,
-          txtResource.label[vm.state.running]
-        );
-        setProperty(
-          vm.state.serviceBtn,
-          hmUI.prop.TEXT,
-          txtResource.btn[vm.state.running]
-        );
-      }
+Page(
+  BasePage({
+    state: {},
+    onInit() {
+      console.log(`========================================`);
+      console.log(`[PAGE] 📄 Page onInit`);
+      console.log(`========================================`);
     },
-  });
-}
-
-Page({
-  state: {
-    running: false,
-    txtLabel: null,
-    serviceBtn: null,
-  },
-  onInit() {
-    logger.log("page on init invoke");
-  },
-  build() {
-    const vm = this;
-    let services = appService.getAllAppServices();
-    vm.state.running = services.includes(serviceFile);
-
-    logger.log("service status %s", vm.state.running);
-
-    // Show tips
-    hmUI.createWidget(hmUI.widget.TEXT, {
-      ...SERVICE_TEXT,
-      text: "Background service:\nsend metrics data every minute!",
-    });
-
-    vm.state.txtLabel = hmUI.createWidget(hmUI.widget.TEXT, {
-      ...SERVICE_LABEL,
-      text: txtResource.label[vm.state.running],
-    });
-
-    vm.state.serviceBtn = hmUI.createWidget(hmUI.widget.BUTTON, {
-      ...SERVICE_BTN,
-      text: txtResource.btn[vm.state.running],
-      click_func: function () {
-        if (vm.state.running) stopTimeService(vm);
-        else permissionRequest(vm);
-      },
-    });
-  },
-  onPause() {
-    logger.log("page on pause invoke");
-  },
-  onResume() {
-    logger.log("page on resume invoke");
-    replace({ url: `${thisFile}` });
-  },
-  onDestroy() {
-    logger.log("page on destroy invoke");
-  },
-});
+    build() {
+      console.log(`[PAGE] Building UI...`);
+      const vm = this;
+      hmUI.createWidget(hmUI.widget.BUTTON, {
+        ...FETCH_BUTTON,
+        click_func: (button_widget) => {
+          console.log("=== User clicked the button ===");
+          permissionRequest(vm);
+        },
+      });
+    },
+    onShow() {
+      console.log(`[PAGE] 👁️  Page shown`);
+    },
+    onHide() {
+      console.log(`[PAGE] 🙈 Page hidden`);
+    },
+    onDestroy() {
+      console.log(`========================================`);
+      console.log(`[PAGE] ⚠️  PAGE BEING DESTROYED`);
+      console.log(`[PAGE] Background service should continue running...`);
+      console.log(`========================================`);
+    }
+  })
+);

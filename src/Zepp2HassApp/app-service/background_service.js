@@ -1,17 +1,61 @@
 import * as notificationMgr from "@zos/notification";
-import { Time } from '@zos/sensor'
+import * as appService from "@zos/app-service";
 import { BasePage } from "@zeppos/zml/base-page";
 import { HeartRate, Battery, BloodOxygen, BodyTemperature, Calorie, Distance, FatBurning, Pai, Screen, Sleep, Stand, Step, Stress, Wear, Workout } from "@zos/sensor";
 import { getProfile } from '@zos/user'
 import { getDeviceInfo } from '@zos/device'
 
-const debugging = false;
-const endPoint = "https://mariella.domotica.uk/api/zepp2hass/dav_watch"
+// ============================================================================
+// CONFIGURATION
+// ============================================================================
+// Read configuration from local storage (synced from settingsStorage by Side Service)
 
-// Store the last error that occurred
+// print storage
+//console.log('storage:', JSON.stringify(storage));
+function getConfig() {
+  return {
+    debugging: false, //storage.getItem('debugMode') === 'true',
+    endPoint: 'https://mariella.domotica.uk/api/zepp2hass/dav_watch', //storage.getItem('endpoint') || 'https://mariella.domotica.uk/api/zepp2hass/dav_watch',
+    httpTimeout: 30000, //parseInt(storage.getItem('httpTimeout') || '30', 10) * 1000, // Convert to milliseconds
+  };
+}
+
+// Track the last error that occurred - this is included in the metrics payload
 let lastError = null;
 
-// Helper function to get current timestamp for logging
+// ============================================================================
+// SENSOR INITIALIZATION
+// ============================================================================
+// Initialize sensors once at module scope to avoid memory leaks
+// These sensors are used throughout the service lifetime
+let battery, bloodOxygen, bodyTemperature, calorie, distance, fatBurning, heartRate, pai, screen, sleep, stand, step, stress, wear, workout;
+try {
+  battery = new Battery();
+  bloodOxygen = new BloodOxygen();
+  bodyTemperature = new BodyTemperature();
+  calorie = new Calorie();
+  distance = new Distance();
+  fatBurning = new FatBurning();
+  heartRate = new HeartRate();
+  pai = new Pai();
+  screen = new Screen();
+  sleep = new Sleep();
+  stand = new Stand();
+  step = new Step();
+  stress = new Stress();
+  wear = new Wear();
+  workout = new Workout();
+} catch (error) {
+  console.log(`[INIT] Failed to initialize sensors: ${error}`);
+}
+// ============================================================================
+// UTILITY FUNCTIONS
+// ============================================================================
+
+/**
+ * Get current timestamp in HH:MM:SS format
+ * Used for logging and error tracking
+ */
 function getTimestamp() {
   const now = new Date();
   const hours = now.getHours().toString().padStart(2, '0');
@@ -20,12 +64,31 @@ function getTimestamp() {
   return `${hours}:${minutes}:${seconds}`;
 }
 
-// Consistent error logging function - easy to search for "[ERR]"
+/**
+ * Get current time in HH:MM format for the record_time field
+ */
+function getRecordTime() {
+  const date = new Date();
+  const hours = date.getHours().toString().padStart(2, '0');
+  const minutes = date.getMinutes().toString().padStart(2, '0');
+  return `${hours}:${minutes}`;
+}
+
+/**
+ * Log an error and store it in lastError for inclusion in metrics payload
+ * All errors are prefixed with [ERR] for easy searching in logs
+ * 
+ * @param {string} location - Where the error occurred (function name)
+ * @param {string} type - Type/category of the error
+ * @param {string} message - Human-readable error message
+ * @param {Error|null} error - The actual error object (optional)
+ */
 function logError(location, type, message, error = null) {
   const timestamp = getTimestamp();
   const errorMsg = error ? ` | ${error.message || String(error)}` : '';
   console.log(`[ERR] [${timestamp}] ${location}::${type}: ${message}${errorMsg}`);
   
+  // Store error details for inclusion in the metrics payload
   lastError = {
     timestamp: timestamp,
     type: type,
@@ -37,7 +100,16 @@ function logError(location, type, message, error = null) {
   return lastError;
 }
 
-// Safe wrapper for sensor operations
+/**
+ * Safely read a value from a sensor
+ * If the sensor method doesn't exist or throws an error, returns the default value
+ * This prevents the entire service from crashing if one sensor fails
+ * 
+ * @param {Object} sensor - The sensor object to read from
+ * @param {string} methodName - Name of the method to call (e.g., 'getCurrent')
+ * @param {*} defaultValue - Value to return if the read fails
+ * @returns {*} The sensor value or defaultValue if read failed
+ */
 function safeSensorGet(sensor, methodName, defaultValue = null) {
   try {
     if (typeof sensor[methodName] === 'function') {
@@ -51,292 +123,376 @@ function safeSensorGet(sensor, methodName, defaultValue = null) {
   }
 }
 
-// Send metrics data to server
-function sendMetrics(vm) {
-  // Guard: Check if vm and httpRequest are valid before proceeding
-  if (!vm || !vm.httpRequest || typeof vm.httpRequest !== 'function') {
-    logError('sendMetrics', 'invalid_vm', 'Service destroyed or httpRequest unavailable');
-    return;
-  }
+// ============================================================================
+// METRICS PAYLOAD BUILDING
+// ============================================================================
 
-  const timestamp = getTimestamp();
-  const startTime = new Date().getTime();
-  
-
-  
-  // Initialize sensors with error handling
-  let battery, bloodOxygen, bodyTemperature, calorie, distance, fatBurning, heartRate, pai, screen, sleep, stand, step, stress, wear, workout;
-  try {
-    battery = new Battery();
-    bloodOxygen = new BloodOxygen();
-    bodyTemperature = new BodyTemperature();
-    calorie = new Calorie();
-    distance = new Distance();
-    fatBurning = new FatBurning();
-    heartRate = new HeartRate();
-    pai = new Pai();
-    screen = new Screen();
-    sleep = new Sleep();
-    stand = new Stand();
-    step = new Step();
-    stress = new Stress();
-    wear = new Wear();
-    workout = new Workout();
-  } catch (error) {
-    logError('sendMetrics', 'sensor_init', 'Failed to initialize sensors', error);
-    return;
-  }
-
-  // Get user profile with error handling
-  let userProfile = null, deviceInfo = null, recordTime = null;
+/**
+ * Build the complete metrics payload by reading from all sensors
+ * This function collects data from all available sensors and formats it
+ * for sending to the server
+ * 
+ * @returns {Object} The complete metrics payload object
+ */
+function buildMetricsPayload() {
+  // Get user and device information
+  let userProfile = null;
+  let deviceInfo = null;
   try {
     userProfile = getProfile();
     deviceInfo = getDeviceInfo();
-    const date = new Date();
-    recordTime = date.getHours().toString().padStart(2, '0') + ':' + date.getMinutes().toString().padStart(2, '0');
   } catch (error) {
-    logError('sendMetrics', userProfile ? 'device_info' : 'user_profile', `Failed to get ${userProfile ? 'device info' : 'user profile'}`, error);
-    return;
+    // Determine which one failed for better error reporting
+    const failedItem = userProfile ? 'device info' : 'user profile';
+    logError('buildMetricsPayload', 'profile_fetch', `Failed to get ${failedItem}`, error);
+    throw error; // Re-throw so caller can handle it
   }
-  
-  // Build request body with safe sensor reads
-  // Safely serialize userProfile and deviceInfo to avoid property access errors
-  // Use a helper function to safely serialize objects
-  function safeSerialize(obj, name) {
-    if (obj === null || obj === undefined) {
-      return null;
-    }
-    try {
-      // Try to serialize - this will catch circular references and non-serializable values
-      return JSON.parse(JSON.stringify(obj));
-    } catch (error) {
-      logError('sendMetrics', `${name}_serialize`, `Failed to serialize ${name}`, error);
-      // Return a safe fallback - just the type/constructor name if available
-      try {
-        return { _error: 'serialization_failed', _type: obj.constructor ? obj.constructor.name : typeof obj };
-      } catch {
-        return null;
-      }
-    }
-  }
-  
-  const reqBody = {
-    record_time: recordTime,
-    user: safeSerialize(userProfile, 'user_profile'),
-    device: safeSerialize(deviceInfo, 'device_info'),
+
+  // Build the complete payload with all sensor data
+  const metricsPayload = {
+    // Basic information
+    record_time: getRecordTime(),
+    user: userProfile,
+    device: deviceInfo,
+    
+    // Battery sensor data
     battery: {
       current: safeSensorGet(battery, 'getCurrent', null),
     },
+    
+    // Blood oxygen sensor data
     blood_oxygen: {
       current: safeSensorGet(bloodOxygen, 'getCurrent', null),
       few_hours: safeSensorGet(bloodOxygen, 'getLastFewHour', null),
       last_day: safeSensorGet(bloodOxygen, 'getLastDay', null),
     },
+    
+    // Body temperature sensor data
     body_temperature: {
       current: safeSensorGet(bodyTemperature, 'getCurrent', null),
-      today: safeSensorGet(bodyTemperature, 'getToday', null),
+      //today: safeSensorGet(bodyTemperature, 'getToday', null), // Commented out - uncomment if needed
     },
+    
+    // Calorie sensor data
     calorie: {
       current: safeSensorGet(calorie, 'getCurrent', null),
       target: safeSensorGet(calorie, 'getTarget', null),
     },
+    
+    // Distance sensor data
     distance: {
       current: safeSensorGet(distance, 'getCurrent', null),
     },
+    
+    // Fat burning sensor data
     fat_burning: {
       current: safeSensorGet(fatBurning, 'getCurrent', null),
       target: safeSensorGet(fatBurning, 'getTarget', null),
     },
+    
+    // Heart rate sensor data
     heart_rate: {
       last: safeSensorGet(heartRate, 'getLast', null),
       resting: safeSensorGet(heartRate, 'getResting', null),
       summary: safeSensorGet(heartRate, 'getDailySummary', null),
     },
+    
+    // PAI (Personal Activity Intelligence) sensor data
     pai: {
       day: safeSensorGet(pai, 'getToday', null),
       week: safeSensorGet(pai, 'getTotal', null),
       last_week: safeSensorGet(pai, 'getLastWeek', null),
     },
+    
+    // Sleep sensor data
     sleep: {
       info: safeSensorGet(sleep, 'getInfo', 0),
-      stg_list: safeSensorGet(sleep, 'getStageConstantObj', 0) ,
+      stg_list: safeSensorGet(sleep, 'getStageConstantObj', 0),
       status: safeSensorGet(sleep, 'getSleepingStatus', 0),
       stage: safeSensorGet(sleep, 'getStage', []),
       nap: safeSensorGet(sleep, 'getNap', []),
     },
+    
+    // Stand sensor data
     stands: {
       current: safeSensorGet(stand, 'getCurrent', null),
       target: safeSensorGet(stand, 'getTarget', null),
     },
+    
+    // Step sensor data
     steps: {
       current: safeSensorGet(step, 'getCurrent', null),
       target: safeSensorGet(step, 'getTarget', null),
     },
+    
+    // Stress sensor data
     stress: {
       current: safeSensorGet(stress, 'getCurrent', null),
-      //today: safeSensorGet(stress, 'getToday', null),
-      today_by_hour: safeSensorGet(stress, 'getTodayByHour', null),
+      //today: safeSensorGet(stress, 'getToday', null), // Commented out - uncomment if needed
+      //today_by_hour: safeSensorGet(stress, 'getTodayByHour', null), // Commented out - uncomment if needed
       last_week: safeSensorGet(stress, 'getLastWeek', null),
-      last_week_by_hour: safeSensorGet(stress, 'getLastWeekByHour', null),
+      //last_week_by_hour: safeSensorGet(stress, 'getLastWeekByHour', null), // Commented out - uncomment if needed
     },
+    
+    // Screen sensor data
     screen: {
       status: safeSensorGet(screen, 'getStatus', null),
       aod_mode: safeSensorGet(screen, 'getAodMode', null),
       light: safeSensorGet(screen, 'getLight', null),
     },
+    
+    // Wear sensor data (whether device is being worn)
     is_wearing: safeSensorGet(wear, 'getStatus', null),
+    
+    // Workout sensor data
     workout: {
       status: safeSensorGet(workout, 'getStatus', null),
       history: safeSensorGet(workout, 'getHistory', []),
     },
+    
+    // Include the last error that occurred (if any)
     last_error: lastError,
   };
   
-  console.log(`[${timestamp}] SENDING METRICS TO ${endPoint}...`);
-  
-  // Safe JSON stringify
-  let requestBody = '';
-  try {
-    requestBody = JSON.stringify(reqBody);
-  } catch (error) {
-    logError('sendMetrics', 'json_serialize', 'Failed to serialize request body', error);
-    return;
-  }
+  return metricsPayload;
+}
 
-  // Wrap httpRequest call in try-catch to prevent service crash
+// ============================================================================
+// NOTIFICATION HELPERS
+// ============================================================================
+
+/**
+ * Show a notification if debugging is enabled
+ * This is useful for testing and debugging the service
+ * 
+ * @param {string} content - The notification content to display
+ */
+function showNotification(content) {
+  const config = getConfig();
+  if (!config.debugging) {
+    return; // Don't show notifications if debugging is disabled
+  }
+  
   try {
-    vm.httpRequest({
-      method: 'POST',
-      url: endPoint,
-      body: requestBody,
-      headers: {
-        'Content-Type': 'application/json'
-      }
-    })
-    .then((result) => {
-      const endTimestamp = getTimestamp();
-      const endTime = new Date().getTime();
-      const duration = endTime - startTime;
-      
-      // Clear the last error on successful request
-      lastError = null;
-      
-      let statusStr = '';
-      try {
-        statusStr = JSON.stringify(result);
-      } catch (error) {
-        statusStr = String(result);
-      }
-      
-      console.log(`[${endTimestamp}] HTTP SUCCESS (${duration}ms): ${statusStr.substring(0, 50)}`);
-      
-      if (debugging) {
-        try {
-          notificationMgr.notify({
-            title: "Agent Service",
-            content: `Success in ${duration}ms`,
-            actions: []
-          });
-        } catch (error) {
-          logError('sendMetrics', 'notification', 'Failed to show success notification', error);
-        }
-      }
-    }).catch((error) => {
-      const endTimestamp = getTimestamp();
-      const endTime = new Date().getTime();
-      const duration = endTime - startTime;
-      
-      logError('sendMetrics', 'http_request', `Request failed after ${duration}ms`, error);
-      
-      if (debugging) {
-        try {
-          notificationMgr.notify({
-            title: "Agent Service",
-            content: `Error: ${error.message || String(error)}`,
-            actions: []
-          });
-        } catch (notifyError) {
-          logError('sendMetrics', 'notification', 'Failed to show error notification', notifyError);
-        }
-      }
+    notificationMgr.notify({
+      title: "Agent Service",
+      content: content,
+      actions: []
     });
   } catch (error) {
-    // Catch synchronous errors from httpRequest call itself
-    logError('sendMetrics', 'http_request_init', 'Failed to initiate HTTP request', error);
+    logError('showNotification', 'notification', 'Failed to show notification', error);
   }
 }
 
-// Continuous running service using timeSensor per-minute callback
-// Reference: https://docs.zepp.com/docs/guides/framework/device/app-service/
+// ============================================================================
+// HTTP REQUEST HANDLING
+// ============================================================================
+
+/**
+ * Send metrics data to the server
+ * This function builds the payload, serializes it, and sends it via HTTP POST
+ * 
+ * @param {Object} vm - The service VM object that provides httpRequest
+ * @returns {Promise} Promise that resolves when the request completes successfully
+ */
+function sendMetrics(vm) {
+  return new Promise((resolve, reject) => {
+    // Step 1: Validate that we have a valid VM with httpRequest method
+    if (!vm || !vm.httpRequest || typeof vm.httpRequest !== 'function') {
+      logError('sendMetrics', 'invalid_vm', 'Service destroyed or httpRequest unavailable');
+      reject(new Error('Invalid VM or httpRequest unavailable'));
+      return;
+    }
+
+    // Step 2: Verify that critical sensors are initialized
+    if (!battery || !heartRate) {
+      logError('sendMetrics', 'sensors_unavailable', 'Sensors not initialized properly');
+      reject(new Error('Sensors not initialized'));
+      return;
+    }
+
+    // Step 3: Track when we started the request (for performance logging)
+    const startTime = new Date().getTime();
+    
+    // Step 4: Build the metrics payload
+    let metricsPayload;
+    try {
+      metricsPayload = buildMetricsPayload();
+    } catch (error) {
+      // If building the payload fails, we can't continue
+      logError('sendMetrics', 'payload_build', 'Failed to build metrics payload', error);
+      reject(error);
+      return;
+    }
+    
+    // Step 5: Get configuration from storage
+    const config = getConfig();
+    
+    // Step 6: Log that we're about to send
+    console.log(`SENDING METRICS TO ${config.endPoint}...`);
+    
+    // Step 7: Serialize the payload to JSON
+    let requestBody = '';
+    try {
+      requestBody = JSON.stringify(metricsPayload);
+    } catch (error) {
+      logError('sendMetrics', 'json_serialize', 'Failed to serialize request body', error);
+      reject(error);
+      return;
+    }
+
+    // Step 8: Make the HTTP POST request
+    // Wrap in try-catch to handle any synchronous errors from httpRequest itself
+    try {
+      const requestOptions = {
+        method: 'POST',
+        url: config.endPoint,
+        body: requestBody,
+        headers: {
+          'Content-Type': 'application/json'
+        }
+      };
+      
+      // Add timeout if supported by the API
+      if (config.httpTimeout && typeof config.httpTimeout === 'number') {
+        requestOptions.timeout = config.httpTimeout;
+      }
+      
+      vm.httpRequest(requestOptions)
+      .then((result) => {
+        // Request succeeded - log success and clear any previous errors
+        const endTimestamp = getTimestamp();
+        const endTime = new Date().getTime();
+        const duration = endTime - startTime;
+        
+        // Clear the last error since we had a successful request
+        lastError = null;
+        
+        // Try to stringify the result for logging, fallback to String() if it fails
+        let statusStr = '';
+        try {
+          statusStr = JSON.stringify(result);
+        } catch (error) {
+          statusStr = String(result);
+        }
+        
+        // Log the success with duration
+        console.log(`[${endTimestamp}] HTTP SUCCESS (${duration}ms): ${statusStr.substring(0, 50)}`);
+        
+        // Show notification if debugging is enabled
+        showNotification(`Success in ${duration}ms`);
+        
+        // Resolve the promise with the result
+        resolve(result);
+      })
+      .catch((error) => {
+        // Request failed - log the error and show notification
+        const endTime = new Date().getTime();
+        const duration = endTime - startTime;
+        
+        logError('sendMetrics', 'http_request', `Request failed after ${duration}ms`, error);
+        showNotification(`Error: ${error.message || String(error)}`);
+        
+        // Reject the promise with the error
+        reject(error);
+      });
+    } catch (error) {
+      // This catches synchronous errors from the httpRequest call itself
+      // (before the promise is returned)
+      logError('sendMetrics', 'http_request_init', 'Failed to initiate HTTP request', error);
+      reject(error);
+    }
+  });
+}
+
+// ============================================================================
+// SERVICE EVENT HANDLERS
+// ============================================================================
+
+/**
+ * Handle a service event (onInit or onEvent)
+ * This function sends metrics and then exits the service
+ * 
+ * @param {string} eventName - Name of the event ('onInit' or 'onEvent')
+ * @param {Object} vm - The service VM object
+ */
+function handleServiceEvent(eventName, vm) {
+  const timestamp = getTimestamp();
+  console.log(`[${timestamp}] service ${eventName}()`);
+  
+  // Send metrics and handle the result
+  sendMetrics(vm)
+    .then(() => {
+      // Success - log and exit
+      console.log(`[${getTimestamp()}] Metrics sent successfully, exiting service`);
+      appService.exit();
+    })
+    .catch((error) => {
+      // Error - log it and exit anyway (we don't want to keep the service running)
+      logError(eventName, 'sendMetrics_failed', 'Failed to send metrics', error);
+      appService.exit();
+    });
+}
+
+// ============================================================================
+// APP SERVICE SETUP
+// ============================================================================
+// This is the entry point for the background service
+// The service is triggered by onInit (when service starts) or onEvent (when triggered)
+
 AppService(
   BasePage({
-    onInit() {
-      console.log("background onInit");
-      const initTimestamp = getTimestamp();
-      console.log(`[${initTimestamp}] ==========================================`);
-      console.log(`[${initTimestamp}] Background service INITIALIZED`);
-      
-      try {
-        console.log(`[${initTimestamp}] Init event: ${JSON.stringify(e)}`);
-      } catch (error) {
-        logError('onInit', 'init_event', 'Failed to serialize init event', error);
-      }
-      
-      // Create timeSensor per instance (not at module level) to avoid stale callbacks
-      let timeSensor = null;
-      try {
-        timeSensor = new Time();
-        // Safely log time sensor info - Time sensor might not have getHours/getMinutes/getSeconds methods
-        try {
-          const now = new Date();
-          console.log(`[${initTimestamp}] Current time: ${now.getHours()}:${now.getMinutes()}:${now.getSeconds()}`);
-        } catch (timeError) {
-          // Ignore time logging errors
-        }
-        console.log(`[${initTimestamp}] System time: ${new Date().toISOString()}`);
-      } catch (error) {
-        logError('onInit', 'time_sensor', 'Failed to initialize time sensor', error);
-        return;
-      }
-      
-      console.log(`[${initTimestamp}] ==========================================`);
-      
-      // Capture the BasePage instance (this) to use in the callback
-      const vm = this;
-      
-      // Track if this service instance is still alive
-        let isAlive = true;
-        
-      // Use onPerMinute() - this matches the official ZeppOS documentation example
-      console.log(`[${initTimestamp}] Registering onPerMinute callback...`);
-      timeSensor.onPerMinute(() => {
-          // Check if this service instance is still alive before proceeding
-          const callbackTimestamp = getTimestamp();
-          console.log(`[${callbackTimestamp}] Running sendMetrics()...`);
-          // Run every 2 minutes
-          //var shouldRun = timeSensor.getMinutes() % 2 == 0;
-          //if (!shouldRun && !debugging) {
-          //  return; 
-          //}
-          try {
-            // Use captured vm instead of this to ensure we have the BasePage instance
-            sendMetrics(vm);
-          } catch (error) {
-            logError('onPerMinute', 'send_metrics', 'Unexpected error in sendMetrics', error);
-          }
-      });
+    state: {
+      // Local state to store settings
+      settings: null,
     },
-    onDestroy() {
-      const destroyTimestamp = getTimestamp();
-      console.log(`[${destroyTimestamp}] ==========================================`);
-      console.log(`[${destroyTimestamp}] Background service DESTROYED`);
-      console.log(`[${destroyTimestamp}] System time: ${new Date().toISOString()}`);
-      console.log(`[${destroyTimestamp}] ==========================================`);
-      
-      // Mark this instance as dead to prevent stale callbacks
-      if (this._cleanup) {
-        this._cleanup();
+    /**
+     * Called when the service receives an event trigger
+     * This happens when the app requests the service to send metrics
+     */
+    onEvent(e) {
+      try {
+        handleServiceEvent('onEvent', this);
+      } catch (error) {
+        // If handleServiceEvent itself throws an error (shouldn't happen, but be safe)
+        logError('onEvent', 'service_crash', 'Service crashed in onEvent', error);
+        appService.exit();
       }
-    }
-  })
+    },
+
+    /**
+     * Called when the service is initialized
+     * This happens when the service first starts
+     */
+    onInit(e) {
+      try {
+        this.fetchSettingsFromPhone();
+        handleServiceEvent('onInit', this);
+      } catch (error) {
+        // If handleServiceEvent itself throws an error (shouldn't happen, but be safe)
+        logError('onInit', 'service_crash', 'Service crashed in onInit', error);
+        appService.exit();
+      }
+    },
+    fetchSettingsFromPhone() {
+      return this.request({
+        // This 'method' name must match the one in your app-side-service
+        method: 'GET_settings',
+        params: {
+          // You can send any parameters here if needed
+        },
+      })
+        .then((result) => {
+          // Successfully received settings from the phone
+          console.log('Got settings:', JSON.stringify(result));
+          this.setState({
+            settings: result,
+          });
+        })
+        .catch((error) => {
+          // An error occurred
+          console.error('Error fetching settings:', error);
+        });
+    },
+  }),
 );
