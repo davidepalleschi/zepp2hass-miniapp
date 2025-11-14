@@ -5,21 +5,6 @@ import { HeartRate, Battery, BloodOxygen, BodyTemperature, Calorie, Distance, Fa
 import { getProfile } from '@zos/user'
 import { getDeviceInfo } from '@zos/device'
 
-// ============================================================================
-// CONFIGURATION
-// ============================================================================
-// Read configuration from local storage (synced from settingsStorage by Side Service)
-
-// print storage
-//console.log('storage:', JSON.stringify(storage));
-function getConfig() {
-  return {
-    debugging: false, //storage.getItem('debugMode') === 'true',
-    endPoint: 'https://mariella.domotica.uk/api/zepp2hass/dav_watch', //storage.getItem('endpoint') || 'https://mariella.domotica.uk/api/zepp2hass/dav_watch',
-    httpTimeout: 30000, //parseInt(storage.getItem('httpTimeout') || '30', 10) * 1000, // Convert to milliseconds
-  };
-}
-
 // Track the last error that occurred - this is included in the metrics payload
 let lastError = null;
 
@@ -265,11 +250,12 @@ function buildMetricsPayload() {
  * Show a notification if debugging is enabled
  * This is useful for testing and debugging the service
  * 
+ * @param {Object} vm - The service VM object
  * @param {string} content - The notification content to display
  */
-function showNotification(content) {
-  const config = getConfig();
-  if (!config.debugging) {
+function showNotification(vm, content) {
+  // Settings come as strings "true" or "false", so we need to compare to string
+  if (vm.state.settings['debugMode'] !== 'true') {
     return; // Don't show notifications if debugging is disabled
   }
   
@@ -324,12 +310,9 @@ function sendMetrics(vm) {
       reject(error);
       return;
     }
-    
-    // Step 5: Get configuration from storage
-    const config = getConfig();
-    
+    console.log('Endpoint is:', vm.state.settings['endpoint']);
     // Step 6: Log that we're about to send
-    console.log(`SENDING METRICS TO ${config.endPoint}...`);
+    console.log(`SENDING METRICS TO ${vm.state.settings['endpoint']}...`);
     
     // Step 7: Serialize the payload to JSON
     let requestBody = '';
@@ -346,17 +329,13 @@ function sendMetrics(vm) {
     try {
       const requestOptions = {
         method: 'POST',
-        url: config.endPoint,
+        url: vm.state.settings['endpoint'],
         body: requestBody,
         headers: {
           'Content-Type': 'application/json'
         }
       };
       
-      // Add timeout if supported by the API
-      if (config.httpTimeout && typeof config.httpTimeout === 'number') {
-        requestOptions.timeout = config.httpTimeout;
-      }
       
       vm.httpRequest(requestOptions)
       .then((result) => {
@@ -380,7 +359,7 @@ function sendMetrics(vm) {
         console.log(`[${endTimestamp}] HTTP SUCCESS (${duration}ms): ${statusStr.substring(0, 50)}`);
         
         // Show notification if debugging is enabled
-        showNotification(`Success in ${duration}ms`);
+        showNotification(vm, `Success in ${duration}ms`);
         
         // Resolve the promise with the result
         resolve(result);
@@ -391,7 +370,7 @@ function sendMetrics(vm) {
         const duration = endTime - startTime;
         
         logError('sendMetrics', 'http_request', `Request failed after ${duration}ms`, error);
-        showNotification(`Error: ${error.message || String(error)}`);
+        showNotification(vm, `Error: ${error.message || String(error)}`);
         
         // Reject the promise with the error
         reject(error);
@@ -466,10 +445,19 @@ AppService(
      */
     onInit(e) {
       try {
-        this.fetchSettingsFromPhone();
-        handleServiceEvent('onInit', this);
+        // Fetch settings from phone first, then send metrics
+        this.fetchSettingsFromPhone()
+          .then(() => {
+            // Settings fetched successfully, now send metrics
+            handleServiceEvent('onInit', this);
+          })
+          .catch((error) => {
+            // Settings fetch failed, log it but still try to send metrics
+            logError('onInit', 'fetch_settings', 'Failed to fetch settings from phone', error);
+            handleServiceEvent('onInit', this);
+          });
       } catch (error) {
-        // If handleServiceEvent itself throws an error (shouldn't happen, but be safe)
+        // If anything throws synchronously (shouldn't happen, but be safe)
         logError('onInit', 'service_crash', 'Service crashed in onInit', error);
         appService.exit();
       }
@@ -485,9 +473,7 @@ AppService(
         .then((result) => {
           // Successfully received settings from the phone
           console.log('Got settings:', JSON.stringify(result));
-          this.setState({
-            settings: result,
-          });
+          this.state.settings = result;
         })
         .catch((error) => {
           // An error occurred
