@@ -22,3 +22,5 @@ Thumbs.db
 
 # ZeppOS
 .zeppos/
+
+store_assets/*
