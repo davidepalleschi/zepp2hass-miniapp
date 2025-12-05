@@ -4,9 +4,22 @@ import { BasePage } from "@zeppos/zml/base-page";
 import { HeartRate, Battery, BloodOxygen, BodyTemperature, Calorie, Distance, FatBurning, Pai, Screen, Sleep, Stand, Step, Stress, Wear, Workout } from "@zos/sensor";
 import { getProfile } from '@zos/user'
 import { getDeviceInfo } from '@zos/device'
+import { localStorage } from "@zos/storage";
+
+// Storage key for statistics (must match the one in page/index.js)
+const STORAGE_KEY_STATS = "zepp2hass_stats";
 
 // Track the last error that occurred - this is included in the metrics payload
 let lastError = null;
+
+// Track service lifecycle state for debugging
+let serviceState = {
+  initTime: null,
+  lastEventTime: null,
+  httpRequestPending: false,
+  httpRequestStartTime: null,
+  destroyReason: null
+};
 
 // ============================================================================
 // SENSOR INITIALIZATION
@@ -14,7 +27,12 @@ let lastError = null;
 // Initialize sensors once at module scope to avoid memory leaks
 // These sensors are used throughout the service lifetime
 let battery, bloodOxygen, bodyTemperature, calorie, distance, fatBurning, heartRate, pai, screen, sleep, stand, step, stress, wear, workout;
+
+const moduleLoadTime = new Date();
+console.log(`[LOG] [${moduleLoadTime.toISOString()}] [MODULE] background_service.js module loading...`);
+
 try {
+  console.log(`[LOG] [MODULE] Initializing sensors...`);
   battery = new Battery();
   bloodOxygen = new BloodOxygen();
   bodyTemperature = new BodyTemperature();
@@ -30,15 +48,24 @@ try {
   stress = new Stress();
   wear = new Wear();
   workout = new Workout();
+  console.log(`[LOG] [MODULE] All sensors initialized successfully`);
 } catch (error) {
-  console.log(`[INIT] Failed to initialize sensors: ${error}`);
+  console.log(`[LOG] [MODULE] FAILED to initialize sensors: ${error?.message || String(error)}`);
+  // Store this as the first error
+  lastError = {
+    timestamp: moduleLoadTime.toISOString(),
+    type: 'sensor_init',
+    location: 'module_load',
+    message: 'Failed to initialize sensors',
+    error: error?.message || String(error)
+  };
 }
 // ============================================================================
 // UTILITY FUNCTIONS
 // ============================================================================
 
 /**
- * Get current timestamp in HH:MM:SS format
+ * Get current timestamp in HH:MM:SS.mmm format (with milliseconds)
  * Used for logging and error tracking
  */
 function getTimestamp() {
@@ -46,7 +73,18 @@ function getTimestamp() {
   const hours = now.getHours().toString().padStart(2, '0');
   const minutes = now.getMinutes().toString().padStart(2, '0');
   const seconds = now.getSeconds().toString().padStart(2, '0');
-  return `${hours}:${minutes}:${seconds}`;
+  const ms = now.getMilliseconds().toString().padStart(3, '0');
+  return `${hours}:${minutes}:${seconds}.${ms}`;
+}
+
+/**
+ * Enhanced logging function with consistent format
+ * All logs are prefixed with [LOG] for easy filtering
+ */
+function log(tag, message, data = null) {
+  const timestamp = getTimestamp();
+  const dataStr = data !== null ? ` | ${typeof data === 'object' ? JSON.stringify(data) : data}` : '';
+  console.log(`[LOG] [${timestamp}] [${tag}] ${message}${dataStr}`);
 }
 
 /**
@@ -57,6 +95,75 @@ function getRecordTime() {
   const hours = date.getHours().toString().padStart(2, '0');
   const minutes = date.getMinutes().toString().padStart(2, '0');
   return `${hours}:${minutes}`;
+}
+
+// ============================================================================
+// STATISTICS MANAGEMENT
+// ============================================================================
+
+/**
+ * Load statistics from local storage
+ * @returns {Object} Statistics object with default values if not found
+ */
+function loadStats() {
+  try {
+    const statsJson = localStorage.getItem(STORAGE_KEY_STATS);
+    if (statsJson) {
+      const parsed = JSON.parse(statsJson);
+      // Ensure lastError field exists
+      if (parsed.lastError === undefined) {
+        parsed.lastError = null;
+      }
+      return parsed;
+    }
+  } catch (error) {
+    log('STATS', 'Error loading stats', { error: error?.message || String(error) });
+  }
+  // Return default stats if not found or error
+  return {
+    successCount: 0,
+    errorCount: 0,
+    lastSyncTime: null,
+    lastStatus: "unknown",
+    lastError: null,
+  };
+}
+
+/**
+ * Save statistics to local storage
+ * @param {Object} stats - Statistics object to save
+ */
+function saveStats(stats) {
+  try {
+    localStorage.setItem(STORAGE_KEY_STATS, JSON.stringify(stats));
+    log('STATS', 'Stats saved successfully', stats);
+  } catch (error) {
+    log('STATS', 'Error saving stats', { error: error?.message || String(error) });
+  }
+}
+
+/**
+ * Update statistics after a request completes
+ * @param {boolean} success - Whether the request was successful
+ * @param {string|null} errorMessage - Error message if failed
+ */
+function updateStats(success, errorMessage = null) {
+  const stats = loadStats();
+  const timestamp = getRecordTime();
+  
+  if (success) {
+    stats.successCount++;
+    stats.lastStatus = "success";
+    stats.lastError = null; // Clear error on success
+  } else {
+    stats.errorCount++;
+    stats.lastStatus = "error";
+    stats.lastError = errorMessage || "Unknown error";
+  }
+  stats.lastSyncTime = timestamp;
+  
+  saveStats(stats);
+  return stats;
 }
 
 /**
@@ -285,15 +392,19 @@ function sendMetrics(vm) {
   return new Promise((resolve, reject) => {
     // Step 1: Validate that we have a valid VM with httpRequest method
     if (!vm || !vm.httpRequest || typeof vm.httpRequest !== 'function') {
-      logError('sendMetrics', 'invalid_vm', 'Service destroyed or httpRequest unavailable');
-      reject(new Error('Invalid VM or httpRequest unavailable'));
+      const errMsg = 'Service destroyed or httpRequest unavailable';
+      logError('sendMetrics', 'invalid_vm', errMsg);
+      updateStats(false, errMsg);
+      reject(new Error(errMsg));
       return;
     }
 
     // Step 2: Verify that critical sensors are initialized
     if (!battery || !heartRate) {
-      logError('sendMetrics', 'sensors_unavailable', 'Sensors not initialized properly');
-      reject(new Error('Sensors not initialized'));
+      const errMsg = 'Sensors not initialized';
+      logError('sendMetrics', 'sensors_unavailable', errMsg);
+      updateStats(false, errMsg);
+      reject(new Error(errMsg));
       return;
     }
 
@@ -306,20 +417,35 @@ function sendMetrics(vm) {
       metricsPayload = buildMetricsPayload();
     } catch (error) {
       // If building the payload fails, we can't continue
+      const errMsg = error?.message || 'Failed to build payload';
       logError('sendMetrics', 'payload_build', 'Failed to build metrics payload', error);
+      updateStats(false, errMsg);
       reject(error);
       return;
     }
-    console.log('Endpoint is:', vm.state.settings['endpoint']);
-    // Step 6: Log that we're about to send
-    console.log(`SENDING METRICS TO ${vm.state.settings['endpoint']}...`);
+    
+    // Check if endpoint is configured
+    const endpoint = vm.state.settings ? vm.state.settings['endpoint'] : null;
+    if (!endpoint) {
+      const errMsg = 'No endpoint configured';
+      logError('sendMetrics', 'no_endpoint', errMsg);
+      updateStats(false, errMsg);
+      reject(new Error(errMsg));
+      return;
+    }
+    
+    log('HTTP', `Endpoint configured: ${endpoint}`);
+    log('HTTP', `SENDING METRICS TO ${endpoint}...`);
     
     // Step 7: Serialize the payload to JSON
     let requestBody = '';
     try {
       requestBody = JSON.stringify(metricsPayload);
+      log('HTTP', `Payload serialized successfully`, { size: requestBody.length, hasLastError: !!metricsPayload.last_error });
     } catch (error) {
+      const errMsg = error?.message || 'JSON serialize failed';
       logError('sendMetrics', 'json_serialize', 'Failed to serialize request body', error);
+      updateStats(false, errMsg);
       reject(error);
       return;
     }
@@ -329,20 +455,48 @@ function sendMetrics(vm) {
     try {
       const requestOptions = {
         method: 'POST',
-        url: vm.state.settings['endpoint'],
+        url: endpoint,
         body: requestBody,
         headers: {
           'Content-Type': 'application/json'
         }
       };
       
+      // Track that we have a pending HTTP request
+      serviceState.httpRequestPending = true;
+      serviceState.httpRequestStartTime = startTime;
       
-      vm.httpRequest(requestOptions)
+      log('HTTP', 'Calling vm.httpRequest() NOW...');
+      
+      // Create a timeout promise to detect hung requests
+      const HTTP_TIMEOUT_MS = 30000; // 30 seconds timeout
+      let timeoutId = null;
+      const timeoutPromise = new Promise((_, timeoutReject) => {
+        timeoutId = setTimeout(() => {
+          log('HTTP', `REQUEST TIMEOUT after ${HTTP_TIMEOUT_MS}ms - no response received`);
+          logError('sendMetrics', 'http_timeout', `Request timed out after ${HTTP_TIMEOUT_MS}ms`);
+          timeoutReject(new Error(`HTTP request timed out after ${HTTP_TIMEOUT_MS}ms`));
+        }, HTTP_TIMEOUT_MS);
+      });
+      
+      const httpPromise = vm.httpRequest(requestOptions);
+      
+      log('HTTP', 'httpRequest() called - promise created, waiting for response...');
+      
+      // Race between the actual request and the timeout
+      Promise.race([httpPromise, timeoutPromise])
       .then((result) => {
+        // Clear the timeout since we got a response
+        if (timeoutId) clearTimeout(timeoutId);
+        
         // Request succeeded - log success and clear any previous errors
         const endTimestamp = getTimestamp();
         const endTime = new Date().getTime();
         const duration = endTime - startTime;
+        
+        // Update service state
+        serviceState.httpRequestPending = false;
+        serviceState.httpRequestStartTime = null;
         
         // Clear the last error since we had a successful request
         lastError = null;
@@ -356,7 +510,10 @@ function sendMetrics(vm) {
         }
         
         // Log the success with duration
-        console.log(`[${endTimestamp}] HTTP SUCCESS (${duration}ms): ${statusStr.substring(0, 50)}`);
+        log('HTTP', `SUCCESS after ${duration}ms`, { response: statusStr.substring(0, 100) });
+        
+        // Update statistics
+        updateStats(true);
         
         // Show notification if debugging is enabled
         showNotification(vm, `Success in ${duration}ms`);
@@ -365,12 +522,25 @@ function sendMetrics(vm) {
         resolve(result);
       })
       .catch((error) => {
+        // Clear the timeout
+        if (timeoutId) clearTimeout(timeoutId);
+        
         // Request failed - log the error and show notification
         const endTime = new Date().getTime();
         const duration = endTime - startTime;
         
+        // Update service state
+        serviceState.httpRequestPending = false;
+        serviceState.httpRequestStartTime = null;
+        
+        const errorStr = error ? (error.message || String(error)) : 'Unknown error';
+        log('HTTP', `FAILED after ${duration}ms`, { error: errorStr });
         logError('sendMetrics', 'http_request', `Request failed after ${duration}ms`, error);
-        showNotification(vm, `Error: ${error.message || String(error)}`);
+        
+        // Update statistics with error message
+        updateStats(false, errorStr);
+        
+        showNotification(vm, `Error: ${errorStr}`);
         
         // Reject the promise with the error
         reject(error);
@@ -378,7 +548,11 @@ function sendMetrics(vm) {
     } catch (error) {
       // This catches synchronous errors from the httpRequest call itself
       // (before the promise is returned)
+      serviceState.httpRequestPending = false;
+      const errMsg = error?.message || String(error) || 'HTTP request init failed';
+      log('HTTP', 'SYNC ERROR - httpRequest() threw synchronously', { error: errMsg });
       logError('sendMetrics', 'http_request_init', 'Failed to initiate HTTP request', error);
+      updateStats(false, errMsg);
       reject(error);
     }
   });
@@ -396,18 +570,24 @@ function sendMetrics(vm) {
  * @param {Object} vm - The service VM object
  */
 function handleServiceEvent(eventName, vm) {
-  const timestamp = getTimestamp();
-  console.log(`[${timestamp}] service ${eventName}()`);
+  serviceState.lastEventTime = new Date().getTime();
+  
+  log('SERVICE', `=== ${eventName}() START ===`);
+  log('SERVICE', `Service state`, { 
+    initTime: serviceState.initTime,
+    httpPending: serviceState.httpRequestPending 
+  });
   
   // Send metrics and handle the result
   sendMetrics(vm)
     .then(() => {
       // Success - log and exit
-      console.log(`[${getTimestamp()}] Metrics sent successfully, exiting service`);
+      log('SERVICE', `Metrics sent successfully, calling appService.exit()`);
       appService.exit();
     })
     .catch((error) => {
       // Error - log it and exit anyway (we don't want to keep the service running)
+      log('SERVICE', `Metrics FAILED, calling appService.exit() anyway`, { error: error?.message || String(error) });
       logError(eventName, 'sendMetrics_failed', 'Failed to send metrics', error);
       appService.exit();
     });
@@ -425,16 +605,21 @@ AppService(
       // Local state to store settings
       settings: null,
     },
+    
     /**
      * Called when the service receives an event trigger
      * This happens when the app requests the service to send metrics
      */
     onEvent(e) {
+      log('LIFECYCLE', '>>> onEvent() triggered', { event: e });
       try {
         handleServiceEvent('onEvent', this);
       } catch (error) {
         // If handleServiceEvent itself throws an error (shouldn't happen, but be safe)
+        const errorMsg = error?.message || String(error);
+        log('LIFECYCLE', 'CRASH in onEvent()', { error: errorMsg });
         logError('onEvent', 'service_crash', 'Service crashed in onEvent', error);
+        updateStats(false, `Crash: ${errorMsg}`);
         appService.exit();
       }
     },
@@ -444,25 +629,61 @@ AppService(
      * This happens when the service first starts
      */
     onInit(e) {
+      serviceState.initTime = new Date().getTime();
+      log('LIFECYCLE', '>>> onInit() called - SERVICE STARTING', { event: e });
+      log('LIFECYCLE', `Sensors initialized: battery=${!!battery}, heartRate=${!!heartRate}`);
+      
       try {
+        log('LIFECYCLE', 'Fetching settings from phone...');
         // Fetch settings from phone first, then send metrics
         this.fetchSettingsFromPhone()
           .then(() => {
             // Settings fetched successfully, now send metrics
+            log('LIFECYCLE', 'Settings fetched, proceeding to send metrics');
             handleServiceEvent('onInit', this);
           })
           .catch((error) => {
             // Settings fetch failed, log it but still try to send metrics
+            log('LIFECYCLE', 'Settings fetch FAILED, will try with defaults', { error: error?.message || String(error) });
             logError('onInit', 'fetch_settings', 'Failed to fetch settings from phone', error);
             handleServiceEvent('onInit', this);
           });
       } catch (error) {
         // If anything throws synchronously (shouldn't happen, but be safe)
+        const errorMsg = error?.message || String(error);
+        log('LIFECYCLE', 'SYNC CRASH in onInit()', { error: errorMsg });
         logError('onInit', 'service_crash', 'Service crashed in onInit', error);
+        updateStats(false, `Init crash: ${errorMsg}`);
         appService.exit();
       }
     },
+    
+    /**
+     * Called when the service is being destroyed
+     * This is CRITICAL for debugging - logs why/when the service dies
+     */
+    onDestroy() {
+      const now = new Date().getTime();
+      const uptimeMs = serviceState.initTime ? (now - serviceState.initTime) : 'unknown';
+      const httpPendingDuration = serviceState.httpRequestStartTime ? (now - serviceState.httpRequestStartTime) : null;
+      
+      log('LIFECYCLE', '!!! onDestroy() called - SERVICE BEING DESTROYED !!!');
+      log('LIFECYCLE', `Service uptime: ${uptimeMs}ms`);
+      log('LIFECYCLE', `HTTP request was pending: ${serviceState.httpRequestPending}`);
+      if (httpPendingDuration !== null) {
+        log('LIFECYCLE', `HTTP request pending for: ${httpPendingDuration}ms before destroy`);
+      }
+      log('LIFECYCLE', `Last error at destroy time`, lastError);
+      
+      // If we had a pending HTTP request when destroyed, this is the smoking gun!
+      if (serviceState.httpRequestPending) {
+        console.log(`[CRITICAL] SERVICE DESTROYED WITH PENDING HTTP REQUEST! This explains missing metrics!`);
+        console.log(`[CRITICAL] HTTP request started ${httpPendingDuration}ms ago and never completed`);
+      }
+    },
+    
     fetchSettingsFromPhone() {
+      log('SETTINGS', 'Requesting settings via this.request()...');
       return this.request({
         // This 'method' name must match the one in your app-side-service
         method: 'GET_settings',
@@ -472,12 +693,13 @@ AppService(
       })
         .then((result) => {
           // Successfully received settings from the phone
-          console.log('Got settings:', JSON.stringify(result));
+          log('SETTINGS', 'Got settings from phone', result);
           this.state.settings = result;
         })
         .catch((error) => {
           // An error occurred
-          console.error('Error fetching settings:', error);
+          log('SETTINGS', 'ERROR fetching settings', { error: error?.message || String(error) });
+          throw error; // Re-throw so caller knows it failed
         });
     },
   }),
